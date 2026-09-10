@@ -8,7 +8,7 @@ fn main() {
         .map(|d| format!("{:x}", d.as_secs()))
         .unwrap_or_else(|_| "0".into());
     let build = format!("{sha}-{uniq}");
-    println!("cargo:rustc-env=DS940DW_BUILD={build}");
+    println!("cargo:rustc-env=SCANBUDDY_BUILD={build}");
 }
 
 fn git(args: &[&str]) -> Option<String> {

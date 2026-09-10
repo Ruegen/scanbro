@@ -18,7 +18,7 @@ use crate::escl::EsclClient;
 use crate::ocr::OcrEngine;
 use crate::state::{AppState, ConnectionState, FeederKind, ScanPreset, SharedState, TransportPref};
 
-const BUILD: &str = env!("DS940DW_BUILD");
+const BUILD: &str = env!("SCANBUDDY_BUILD");
 
 const BG: Color = Color::from_rgb(0.09, 0.10, 0.14);
 const SURFACE: Color = Color::from_rgb(0.14, 0.16, 0.22);
@@ -72,7 +72,7 @@ pub struct Dashboard {
 
 pub fn run() -> iced::Result {
     iced::application(
-        concat!("DS-940DW Scanner · ", env!("DS940DW_BUILD")),
+        concat!("Scanbuddy · ", env!("SCANBUDDY_BUILD")),
         Dashboard::update,
         Dashboard::view,
     )
@@ -1227,11 +1227,11 @@ fn pill(fill: Color) -> container::Style {
 
 fn spawn_backend(state: SharedState, mut cmd_rx: mpsc::UnboundedReceiver<BackendCmd>) {
     std::thread::Builder::new()
-        .name("ds940dw-backend".into())
+        .name("scanbuddy-backend".into())
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
-                .thread_name("ds940dw-worker")
+                .thread_name("scanbuddy-worker")
                 .build()
                 .expect("tokio runtime");
             rt.block_on(async move {

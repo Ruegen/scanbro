@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Scanbuddy
+Comment=Scan from a Brother scanner
+Exec=scanbuddy
+Icon=scanner
+Terminal=false
+Categories=Graphics;Scanning;Utility;
+Keywords=scanner;brother;escl;duplex;ocr;pdf;
+StartupNotify=true
+StartupWMClass=scanbuddy

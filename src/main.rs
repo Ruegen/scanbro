@@ -32,11 +32,11 @@ fn main() -> AppResult<()> {
         }
         Some("--help") | Some("-h") => {
             eprintln!(
-                "ds940dw — Brother DS-940DW scanner\n\
+                "scanbuddy — scan from a Brother scanner\n\
                  \n\
                  Usage:\n\
-                   ds940dw              graphical dashboard\n\
-                   ds940dw --discover   list scanners found on the network\n"
+                   scanbuddy              graphical dashboard\n\
+                   scanbuddy --discover   list scanners found on the network\n"
             );
             Ok(())
         }

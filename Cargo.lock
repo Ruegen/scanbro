@@ -990,31 +990,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ds940dw"
-version = "0.2.0"
-dependencies = [
- "bytes",
- "chrono",
- "dirs 6.0.0",
- "futures-util",
- "http",
- "iced",
- "if-addrs",
- "image 0.25.10",
- "mdns-sd",
- "multer",
- "parking_lot 0.12.5",
- "pdf-writer",
- "quick-xml 0.37.5",
- "reqwest",
- "rfd",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "dtor"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3804,6 +3779,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "scanbuddy"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "chrono",
+ "dirs 6.0.0",
+ "futures-util",
+ "http",
+ "iced",
+ "if-addrs",
+ "image 0.25.10",
+ "mdns-sd",
+ "multer",
+ "parking_lot 0.12.5",
+ "pdf-writer",
+ "quick-xml 0.37.5",
+ "reqwest",
+ "rfd",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

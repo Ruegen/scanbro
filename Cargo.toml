@@ -1,8 +1,8 @@
 [package]
-name = "ds940dw"
+name = "scanbuddy"
 version = "0.2.0"
 edition = "2021"
-description = "Brother DS-940DW scanner with a graphical dashboard"
+description = "A friendly scanner app for Brother scanners"
 license = "MIT"
 publish = false
 rust-version = "1.80"

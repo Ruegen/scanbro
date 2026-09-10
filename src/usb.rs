@@ -216,7 +216,7 @@ pub async fn scan_duplex(
     dpi: u16,
 ) -> AppResult<(Arc<Vec<u8>>, Arc<Vec<u8>>)> {
     let dir = PathBuf::from("/dev/shm").join(format!(
-        "ds940dw-{}-{}",
+        "scanbuddy-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
