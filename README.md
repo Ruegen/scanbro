@@ -2,6 +2,8 @@
 
 Scan from a Brother scanner. Save a PDF, or email a copy under 5 MB.
 
+Made for [Omarchy](https://omarchy.org). Email opens in Omamail when that is your mail app.
+
 <p align="center">
   <img src="screenshot.png" alt="Scanbro">
 </p>
