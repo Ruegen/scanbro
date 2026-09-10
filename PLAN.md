@@ -19,3 +19,7 @@ Scanbro should work with Brother scanners in general, not only the DS-940DW. Kee
 - A simplex DS-640 (forces duplex to be optional).
 
 Leave the product named Scanbro. The DS-940DW stays the well-tested default until a second model actually works.
+
+## Keyboard (Omarchy)
+
+Made for Omarchy, so the app should be usable from the keyboard without the mouse. Scan, save, email, quality, connection, and checkboxes should all have keys. Tab order should follow the screen. Do not add actions that exist only as a click.
