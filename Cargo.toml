@@ -1,0 +1,40 @@
+[package]
+name = "ds940dw"
+version = "0.2.0"
+edition = "2021"
+description = "Brother DS-940DW scanner with a graphical dashboard"
+license = "MIT"
+publish = false
+rust-version = "1.80"
+
+[features]
+default = []
+bundle-ocr = []
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "stream"] }
+mdns-sd = "0.13"
+quick-xml = "0.37"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+thiserror = "2"
+bytes = "1"
+futures-util = "0.3"
+parking_lot = "0.12"
+iced = { version = "0.13", features = ["tokio", "image", "advanced"] }
+pdf-writer = "0.12"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+dirs = "6"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+multer = { version = "3", default-features = false, features = ["tokio-io"] }
+if-addrs = "0.13"
+http = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3
+panic = "abort"
