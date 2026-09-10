@@ -1,0 +1,13 @@
+---
+description: Scanbro later plans — other Brother scanners
+alwaysApply: true
+---
+
+# Scanbro later plans
+
+Read `PLAN.md` in this repo before growing scanner support.
+
+- Other Brother scanners, not only the DS-940DW.
+- Drive controls from eSCL scanner capabilities, not a model-name list.
+- Keep the product to scan → PDF → email → optional text.
+- Do not add old Brother TWAIN / brscan stacks.
