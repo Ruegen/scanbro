@@ -5,7 +5,7 @@ Scan from a Brother scanner. Save a PDF, or email a copy under 5 MB.
 Made for [Omarchy](https://omarchy.org).
 
 <p align="center">
-  <img src="screenshot.png" alt="Scanbro">
+  <img src="screenshot-2026-09-11.png" alt="Scanbro">
 </p>
 
 ## Features
