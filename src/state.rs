@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -102,6 +103,35 @@ impl ScannerInfo {
         }
         score
     }
+
+    pub fn device_key(&self) -> String {
+        match self.via {
+            Transport::Usb => match &self.sane_device {
+                Some(dev) => format!("usb:{dev}"),
+                None => format!("usb:ipp:{}", self.port),
+            },
+            Transport::Wifi => format!("wifi:{}", self.ip),
+        }
+    }
+
+    pub fn auto_score(&self) -> i32 {
+        let mut score = match self.via {
+            Transport::Usb => 1_000,
+            Transport::Wifi => self.wifi_quality(),
+        };
+        let name = self.name.to_ascii_uppercase();
+        if name.contains("DS-940") {
+            score += 50;
+        }
+        score
+    }
+
+    pub fn picker_line(&self) -> String {
+        match self.via {
+            Transport::Usb => format!("{}  USB", self.name),
+            Transport::Wifi => format!("{}  Wi-Fi  {}", self.name, self.ip),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -131,8 +161,10 @@ impl ScannerStatus {
             FeederKind::Pulling
         } else if adf.contains("loaded") || adf.contains("ready") {
             FeederKind::Loaded
-        } else if adf.contains("empty") || adf.is_empty() {
+        } else if adf.contains("empty") {
             FeederKind::Empty
+        } else if adf.is_empty() {
+            FeederKind::Unknown
         } else {
             FeederKind::Unknown
         }
@@ -327,6 +359,9 @@ pub struct AppState {
     pub page_texts: Vec<String>,
     pub sheets: u32,
     pub transport_pref: TransportPref,
+    pub discovered: Vec<ScannerInfo>,
+    pub preferred_id: Option<String>,
+    pub last_escl_job: Option<String>,
 }
 
 impl Default for AppState {
@@ -357,18 +392,231 @@ impl Default for AppState {
             page_texts: Vec::new(),
             sheets: 0,
             transport_pref: TransportPref::Auto,
+            discovered: Vec::new(),
+            preferred_id: load_preferred(),
+            last_escl_job: None,
         }
     }
 }
 
 impl AppState {
+    pub fn busy_scan(&self) -> bool {
+        matches!(
+            self.connection,
+            ConnectionState::Scanning | ConnectionState::RunningOcr
+        ) || self.prompt_continue
+            || self.waiting_for_paper
+    }
+
+    pub fn visible_scanners(&self) -> Vec<&ScannerInfo> {
+        self.discovered
+            .iter()
+            .filter(|s| self.transport_pref.matches(s.via))
+            .collect()
+    }
+
+    pub fn offer_scanner(&mut self, scanner: ScannerInfo) {
+        if !self.transport_pref.matches(scanner.via) {
+            return;
+        }
+        let key = scanner.device_key();
+        if let Some(slot) = self
+            .discovered
+            .iter_mut()
+            .find(|s| s.device_key() == key)
+        {
+            if scanner.auto_score() >= slot.auto_score() {
+                *slot = scanner.clone();
+            }
+        } else {
+            self.discovered.push(scanner.clone());
+        }
+
+        if self.scanner.as_ref().is_some_and(|s| s.device_key() == key) {
+            self.scanner = Some(scanner);
+            return;
+        }
+        if self.busy_scan() {
+            return;
+        }
+
+        let preferred_live = self.preferred_id.as_ref().is_some_and(|pref| {
+            self.discovered
+                .iter()
+                .any(|s| s.device_key() == *pref && self.transport_pref.matches(s.via))
+        });
+        if preferred_live {
+            if self.preferred_id.as_deref() == Some(key.as_str()) {
+                self.apply_scanner(scanner);
+            }
+            return;
+        }
+
+        match &self.scanner {
+            None => self.apply_scanner(scanner),
+            Some(cur) if scanner.auto_score() > cur.auto_score() => self.apply_scanner(scanner),
+            Some(_) => {}
+        }
+    }
+
+    pub fn select_scanner(&mut self, key: &str) {
+        if self.busy_scan() {
+            return;
+        }
+        let Some(scanner) = self
+            .discovered
+            .iter()
+            .find(|s| s.device_key() == key && self.transport_pref.matches(s.via))
+            .cloned()
+        else {
+            return;
+        };
+        self.preferred_id = Some(key.to_string());
+        save_preferred(key);
+        self.apply_scanner(scanner);
+    }
+
+    pub fn cycle_scanner(&mut self, dir: i32) {
+        let keys: Vec<String> = self
+            .visible_scanners()
+            .into_iter()
+            .map(|s| s.device_key())
+            .collect();
+        if keys.len() < 2 {
+            return;
+        }
+        let current = self.scanner.as_ref().map(|s| s.device_key());
+        let idx = current
+            .as_ref()
+            .and_then(|id| keys.iter().position(|k| k == id))
+            .unwrap_or(0);
+        let next = if dir < 0 {
+            (idx + keys.len() - 1) % keys.len()
+        } else {
+            (idx + 1) % keys.len()
+        };
+        self.select_scanner(&keys[next]);
+    }
+
+    pub fn forget_via(&mut self, via: Transport, reason: impl Into<String>) {
+        let current_hit = self.scanner.as_ref().is_some_and(|s| s.via == via);
+        self.discovered.retain(|s| s.via != via);
+        if current_hit {
+            self.drop_current(reason);
+        }
+    }
+
     pub fn mark_disconnected(&mut self, reason: impl Into<String>) {
-        self.connection = ConnectionState::AwaitingConnection;
+        if let Some(key) = self.scanner.as_ref().map(|s| s.device_key()) {
+            self.discovered.retain(|s| s.device_key() != key);
+        }
+        self.drop_current(reason);
+    }
+
+    pub fn apply_transport(&mut self, pref: TransportPref) {
+        self.transport_pref = pref;
+        if self
+            .scanner
+            .as_ref()
+            .is_some_and(|s| !pref.matches(s.via))
+        {
+            self.scanner = None;
+            self.status = None;
+            self.progress = ScanProgress::default();
+            self.try_auto_connect();
+            if self.scanner.is_none() {
+                self.connection = ConnectionState::AwaitingConnection;
+                self.status_line = match pref {
+                    TransportPref::Usb => "Looking for your scanner on USB…".into(),
+                    TransportPref::Wifi => "Looking for your scanner on Wi-Fi…".into(),
+                    TransportPref::Auto => "Looking for your scanner…".into(),
+                };
+            }
+        } else {
+            self.status_line = match pref {
+                TransportPref::Usb => "Using USB.".into(),
+                TransportPref::Wifi => "Using Wi-Fi.".into(),
+                TransportPref::Auto => "Using Wi-Fi or USB.".into(),
+            };
+        }
+    }
+
+    fn drop_current(&mut self, reason: impl Into<String>) {
         self.scanner = None;
         self.status = None;
         self.progress = ScanProgress::default();
-        self.status_line = reason.into();
+        if !self.busy_scan() {
+            self.try_auto_connect();
+        }
+        if self.scanner.is_none() {
+            self.connection = ConnectionState::AwaitingConnection;
+            self.status_line = reason.into();
+        }
     }
+
+    fn try_auto_connect(&mut self) {
+        let candidates: Vec<ScannerInfo> = self
+            .visible_scanners()
+            .into_iter()
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        if let Some(pref) = &self.preferred_id {
+            if let Some(scanner) = candidates.iter().find(|s| s.device_key() == *pref) {
+                self.apply_scanner(scanner.clone());
+                return;
+            }
+        }
+        if let Some(best) = candidates.into_iter().max_by_key(|s| s.auto_score()) {
+            self.apply_scanner(best);
+        }
+    }
+
+    fn apply_scanner(&mut self, scanner: ScannerInfo) {
+        let name = scanner.name.clone();
+        let via = scanner.via;
+        if via == Transport::Usb {
+            self.status = Some(ScannerStatus {
+                state: "Idle".into(),
+                adf_state: "Ready".into(),
+                battery_percent: None,
+                reasons: Vec::new(),
+            });
+        }
+        self.scanner = Some(scanner);
+        self.last_seen = Some(Instant::now());
+        if matches!(
+            self.connection,
+            ConnectionState::AwaitingConnection | ConnectionState::Degraded
+        ) {
+            self.connection = ConnectionState::Connected;
+        }
+        self.status_line = format!("Found {name} on {}.", via.label());
+    }
+}
+
+fn preferred_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("scanbro")
+        .join("preferred")
+}
+
+fn load_preferred() -> Option<String> {
+    std::fs::read_to_string(preferred_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn save_preferred(id: &str) {
+    let path = preferred_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, id);
 }
 
 pub type SharedState = Arc<parking_lot::Mutex<AppState>>;

@@ -1,15 +1,18 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use iced::event::{self, Event, Status as EventStatus};
+use iced::keyboard::{self, Key};
 use iced::widget::button::Status as BtnStatus;
 use iced::widget::{
     button, checkbox, column, container, horizontal_space, image, pick_list, progress_bar, row,
     scrollable, stack, text,
 };
 use iced::{
-    Alignment, Background, Border, Color, ContentFit, Element, Length, Shadow, Size, Subscription,
-    Task, Theme, Vector,
+    Alignment, Background, Border, Color, ContentFit, Element, Font, Length, Shadow, Size,
+    Subscription, Task, Theme,
 };
 use tokio::sync::mpsc;
 use tracing::{error, info};
@@ -19,19 +22,22 @@ use crate::ocr::OcrEngine;
 use crate::state::{AppState, ConnectionState, FeederKind, ScanPreset, SharedState, TransportPref};
 
 const BUILD: &str = env!("SCANBRO_BUILD");
+const FONT: Font = Font::with_name("CaskaydiaMono Nerd Font");
 
-const BG: Color = Color::from_rgb(0.09, 0.10, 0.14);
-const SURFACE: Color = Color::from_rgb(0.14, 0.16, 0.22);
-const SURFACE_2: Color = Color::from_rgb(0.17, 0.19, 0.27);
-const TEXT: Color = Color::from_rgb(0.78, 0.82, 0.96);
-const MUTED: Color = Color::from_rgb(0.55, 0.60, 0.72);
-const ACCENT: Color = Color::from_rgb(0.49, 0.81, 1.0);
-const GREEN: Color = Color::from_rgb(0.18, 0.72, 0.38);
-const GREEN_HOVER: Color = Color::from_rgb(0.32, 0.88, 0.50);
-const GREEN_PRESS: Color = Color::from_rgb(0.12, 0.54, 0.28);
-const AMBER: Color = Color::from_rgb(0.91, 0.72, 0.29);
-const RED: Color = Color::from_rgb(0.91, 0.38, 0.38);
-const INK: Color = Color::from_rgb(0.08, 0.09, 0.13);
+// Tokyo Night — matches the usual Omarchy riced look.
+const BG: Color = Color::from_rgb(0.102, 0.106, 0.149); // #1a1b26
+const SURFACE: Color = Color::from_rgb(0.141, 0.153, 0.227); // #24283b
+const SURFACE_2: Color = Color::from_rgb(0.161, 0.173, 0.259); // #292e42
+const LINE: Color = Color::from_rgb(0.227, 0.239, 0.322); // #3a3d52
+const TEXT: Color = Color::from_rgb(0.753, 0.792, 0.961); // #c0caf5
+const MUTED: Color = Color::from_rgb(0.337, 0.373, 0.537); // #565f89
+const ACCENT: Color = Color::from_rgb(0.490, 0.812, 1.0); // #7dcfff
+const GREEN: Color = Color::from_rgb(0.620, 0.808, 0.416); // #9ece6a
+const GREEN_HOVER: Color = Color::from_rgb(0.720, 0.880, 0.520);
+const GREEN_PRESS: Color = Color::from_rgb(0.420, 0.620, 0.280);
+const AMBER: Color = Color::from_rgb(0.878, 0.686, 0.408); // #e0af68
+const RED: Color = Color::from_rgb(0.969, 0.463, 0.557); // #f7768e
+const INK: Color = Color::from_rgb(0.063, 0.067, 0.098); // #101019
 const WHITE: Color = Color::from_rgb(0.98, 0.99, 1.0);
 
 #[derive(Debug, Clone)]
@@ -47,6 +53,12 @@ pub enum Message {
     ContinueFeed,
     CancelFeed,
     SetTransport(TransportPref),
+    SelectScanner(String),
+    FlipOcr,
+    FlipContinuous,
+    FlipLongReceipt,
+    KeyDown(String),
+    KeyUp(String),
     PdfDone(Result<PathBuf, String>),
     EmailDone(Result<(), String>),
 }
@@ -68,6 +80,7 @@ pub struct Dashboard {
     email_after: bool,
     pdf_dpi: u16,
     spin_phase: u8,
+    pressed: HashSet<String>,
 }
 
 pub fn run() -> iced::Result {
@@ -78,6 +91,7 @@ pub fn run() -> iced::Result {
     )
         .subscription(Dashboard::subscription)
         .theme(Dashboard::theme)
+        .default_font(FONT)
         .window_size(Size::new(1280.0, 820.0))
         .centered()
         .run_with(Dashboard::new)
@@ -103,6 +117,7 @@ impl Dashboard {
                 email_after: false,
                 pdf_dpi: 300,
                 spin_phase: 0,
+                pressed: HashSet::new(),
             },
             Task::none(),
         )
@@ -122,7 +137,26 @@ impl Dashboard {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(Duration::from_millis(160)).map(|_| Message::Tick)
+        Subscription::batch([
+            iced::time::every(Duration::from_millis(160)).map(|_| Message::Tick),
+            event::listen_with(|event, status, _| {
+                if status == EventStatus::Captured {
+                    return None;
+                }
+                match event {
+                    Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                        if modifiers.control() || modifiers.alt() || modifiers.logo() {
+                            return None;
+                        }
+                        Some(Message::KeyDown(key_id(&key)))
+                    }
+                    Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) => {
+                        Some(Message::KeyUp(key_id(&key)))
+                    }
+                    _ => None,
+                }
+            }),
+        ])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -196,6 +230,47 @@ impl Dashboard {
                 self.shared.lock().long_receipt = enabled;
                 Task::none()
             }
+            Message::FlipOcr => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let mut guard = self.shared.lock();
+                guard.ocr_enabled = !guard.ocr_enabled;
+                Task::none()
+            }
+            Message::FlipContinuous => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let mut guard = self.shared.lock();
+                guard.continuous = !guard.continuous;
+                Task::none()
+            }
+            Message::FlipLongReceipt => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let mut guard = self.shared.lock();
+                guard.long_receipt = !guard.long_receipt;
+                Task::none()
+            }
+            Message::SelectScanner(id) => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                self.shared.lock().select_scanner(&id);
+                Task::none()
+            }
+            Message::KeyDown(key) => {
+                if !self.pressed.insert(key.clone()) {
+                    return Task::none();
+                }
+                self.on_key(&key)
+            }
+            Message::KeyUp(key) => {
+                self.pressed.remove(&key);
+                Task::none()
+            }
             Message::ContinueFeed => {
                 let scan_now = {
                     let mut guard = self.shared.lock();
@@ -233,25 +308,7 @@ impl Dashboard {
                 if self.is_busy() {
                     return Task::none();
                 }
-                let mut guard = self.shared.lock();
-                guard.transport_pref = pref;
-                let mismatch = guard
-                    .scanner
-                    .as_ref()
-                    .is_some_and(|s| !pref.matches(s.via));
-                if mismatch {
-                    guard.mark_disconnected(match pref {
-                        TransportPref::Usb => "Looking for your scanner on USB…",
-                        TransportPref::Wifi => "Looking for your scanner on Wi-Fi…",
-                        TransportPref::Auto => "Looking for your scanner…",
-                    });
-                } else {
-                    guard.status_line = match pref {
-                        TransportPref::Usb => "Using USB.".into(),
-                        TransportPref::Wifi => "Using Wi-Fi.".into(),
-                        TransportPref::Auto => "Using Wi-Fi or USB.".into(),
-                    };
-                }
+                self.shared.lock().apply_transport(pref);
                 Task::none()
             }
             Message::PdfDone(result) => {
@@ -305,6 +362,43 @@ impl Dashboard {
                 }
                 Task::none()
             }
+        }
+    }
+
+    fn on_key(&mut self, key: &str) -> Task<Message> {
+        let prompt = self.shared.lock().prompt_continue;
+        let waiting = self.shared.lock().waiting_for_paper;
+        match key {
+            "s" => self.update(Message::Scan),
+            "p" => self.update(Message::SavePdf),
+            "e" => self.update(Message::EmailPdf),
+            "o" => self.update(Message::FlipOcr),
+            "c" => self.update(Message::FlipContinuous),
+            "l" => self.update(Message::FlipLongReceipt),
+            "a" => self.update(Message::SetTransport(TransportPref::Auto)),
+            "w" => self.update(Message::SetTransport(TransportPref::Wifi)),
+            "u" => self.update(Message::SetTransport(TransportPref::Usb)),
+            "1" => self.update(Message::SetPreset(ScanPreset::Web)),
+            "2" => self.update(Message::SetPreset(ScanPreset::Email)),
+            "3" => self.update(Message::SetPreset(ScanPreset::Document)),
+            "4" => self.update(Message::SetPreset(ScanPreset::Photo)),
+            "5" => self.update(Message::SetPreset(ScanPreset::Fine)),
+            "[" => {
+                if !self.is_busy() {
+                    self.shared.lock().cycle_scanner(-1);
+                }
+                Task::none()
+            }
+            "]" => {
+                if !self.is_busy() {
+                    self.shared.lock().cycle_scanner(1);
+                }
+                Task::none()
+            }
+            "enter" if prompt => self.update(Message::ContinueFeed),
+            "enter" if !waiting => self.update(Message::Scan),
+            "escape" => self.update(Message::CancelFeed),
+            _ => Task::none(),
         }
     }
 
@@ -440,8 +534,8 @@ impl Dashboard {
         );
 
         let main = container(
-            column![header, row![controls, stage].spacing(8).height(Length::Fill)]
-                .spacing(8)
+            column![header, row![controls, stage].spacing(6).height(Length::Fill)]
+                .spacing(6)
                 .height(Length::Fill),
         )
         .padding(8)
@@ -468,29 +562,20 @@ fn header_bar(snap: &AppState) -> Element<'static, Message> {
     let (dot, label) = match snap.connection {
         ConnectionState::Connected
         | ConnectionState::Scanning
-        | ConnectionState::RunningOcr => (GREEN, "Connected"),
-        ConnectionState::Degraded => (RED, "Degraded"),
-        ConnectionState::AwaitingConnection => (AMBER, "Looking…"),
+        | ConnectionState::RunningOcr => (GREEN, "CONNECTED"),
+        ConnectionState::Degraded => (RED, "DEGRADED"),
+        ConnectionState::AwaitingConnection => (AMBER, "LOOKING"),
     };
 
-    let name = snap
-        .scanner
-        .as_ref()
-        .map(|s| s.name.clone())
-        .unwrap_or_else(|| "Brother DS-940DW".into());
-    let via = snap
-        .scanner
-        .as_ref()
-        .map(|s| s.via.label())
-        .unwrap_or("—");
-    let meta = snap
+    let via = snap.scanner.as_ref().map(|s| s.via.label()).unwrap_or("—");
+    let prompt = snap
         .scanner
         .as_ref()
         .map(|s| match s.via {
-            crate::state::Transport::Usb => "USB".into(),
-            crate::state::Transport::Wifi => format!("Wi-Fi · {}", s.ip),
+            crate::state::Transport::Usb => format!("▸  {}  ·  USB", s.name),
+            crate::state::Transport::Wifi => format!("▸  {}  ·  Wi-Fi  {}", s.name, s.ip),
         })
-        .unwrap_or_else(|| "Looking for your scanner…".into());
+        .unwrap_or_else(|| "▸  no scanner".into());
 
     let capturing = snap.connection == ConnectionState::Scanning;
     let feeder_kind = if capturing {
@@ -510,23 +595,22 @@ fn header_bar(snap: &AppState) -> Element<'static, Message> {
     let fault = snap.status.as_ref().and_then(|s| s.fault_message());
     let battery = snap.status.as_ref().and_then(|s| s.battery_percent);
 
-    let status_chip = chip(format!("{label} · {via}"), SURFACE_2, Some(dot));
-    let feeder_chip = chip(feeder_kind.label().to_string(), SURFACE_2, Some(feeder_color));
-    let recipe_chip = chip(
-        {
-            let dpi = snap.scan_preset.dpi();
-            if snap.long_receipt {
-                format!("Long receipt · one side · {dpi} dpi")
-            } else {
-                format!("Duplex · Color · {dpi} dpi")
-            }
-        },
-        SURFACE_2,
-        None,
-    );
+    let recipe = {
+        let dpi = snap.scan_preset.dpi();
+        if snap.long_receipt {
+            format!("RECEIPT  1-SIDE  {dpi}DPI")
+        } else {
+            format!("DUPLEX  COLOR  {dpi}DPI")
+        }
+    };
 
+    let mut chips = row![
+        chip(format!("{label}  {via}"), Some(dot)),
+        chip(feeder_kind.label().to_ascii_uppercase(), Some(feeder_color)),
+        chip(recipe, None),
+    ]
+    .spacing(6);
     let pending = if snap.long_receipt { 1 } else { 2 };
-    let mut chips = row![status_chip, feeder_chip, recipe_chip].spacing(8);
     if snap.pages.len() + usize::from(capturing) * pending > 0 {
         let sheets = if capturing { snap.sheets + 1 } else { snap.sheets };
         let pages = if capturing {
@@ -538,18 +622,17 @@ fn header_bar(snap: &AppState) -> Element<'static, Message> {
             let size = format_bytes(scan_jpeg_bytes(snap) as u64);
             chips = chips.push(chip(
                 if size == "—" {
-                    format!("Sheet {sheets} · {pages} pages")
+                    format!("SHEET {sheets}  {pages}P")
                 } else {
-                    format!("Sheet {sheets} · {pages} pages · {size}")
+                    format!("SHEET {sheets}  {pages}P  {size}")
                 },
-                SURFACE_2,
                 None,
             ));
         }
     }
     if capturing {
         if snap.long_receipt {
-            chips = chips.push(chip("Receipt".into(), SURFACE_2, Some(AMBER)));
+            chips = chips.push(chip("RECEIPT", Some(AMBER)));
         } else {
             let front_color = if snap.progress.front_done { GREEN } else { AMBER };
             let back_color = if snap.progress.back_done {
@@ -559,25 +642,25 @@ fn header_bar(snap: &AppState) -> Element<'static, Message> {
             } else {
                 MUTED
             };
-            chips = chips.push(chip("Front".into(), SURFACE_2, Some(front_color)));
-            chips = chips.push(chip("Back".into(), SURFACE_2, Some(back_color)));
+            chips = chips.push(chip("FRONT", Some(front_color)));
+            chips = chips.push(chip("BACK", Some(back_color)));
         }
     }
     if let Some(percent) = battery {
-        chips = chips.push(chip(format!("Battery {percent}%"), SURFACE_2, None));
+        chips = chips.push(chip(format!("BAT {percent}%"), None));
     }
 
     let mut info = column![
         row![
-            text(name).size(26).color(TEXT),
+            text("SCANBRO").size(14).color(ACCENT),
             horizontal_space(),
-            text(BUILD).size(12).color(MUTED),
+            text("[S] scan  [P] pdf  [E] email  [1-5] quality  [ ] scanner").size(12).color(MUTED),
         ]
         .align_y(Alignment::Center),
-        text(meta).size(14).color(MUTED),
+        text(prompt).size(20).color(TEXT),
         text(snap.status_line.clone()).size(13).color(MUTED),
     ]
-    .spacing(4);
+    .spacing(6);
     if let Some(fault) = fault {
         info = info.push(text(fault).size(14).color(RED));
     }
@@ -590,17 +673,72 @@ fn header_bar(snap: &AppState) -> Element<'static, Message> {
         .into()
 }
 
-fn chip(label: String, fill: Color, dot: Option<Color>) -> Element<'static, Message> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScannerChoice {
+    key: String,
+    line: String,
+}
+
+impl std::fmt::Display for ScannerChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.line)
+    }
+}
+
+fn scanner_pick_list(snap: &AppState) -> Element<'static, Message> {
+    let options: Vec<ScannerChoice> = snap
+        .visible_scanners()
+        .into_iter()
+        .map(|s| ScannerChoice {
+            key: s.device_key(),
+            line: s.picker_line(),
+        })
+        .collect();
+    let selected = snap.scanner.as_ref().and_then(|cur| {
+        options
+            .iter()
+            .find(|choice| choice.key == cur.device_key())
+            .cloned()
+    });
+    pick_list(options, selected, |choice| Message::SelectScanner(choice.key))
+        .placeholder("Looking for a scanner…")
+        .text_size(14)
+        .padding([8, 10])
+        .width(Length::Fill)
+        .style(pick_style)
+        .into()
+}
+
+fn pick_style(_theme: &Theme, status: iced::widget::pick_list::Status) -> iced::widget::pick_list::Style {
+    use iced::widget::pick_list::Status;
+    let border_c = match status {
+        Status::Hovered | Status::Opened => ACCENT,
+        Status::Active => LINE,
+    };
+    iced::widget::pick_list::Style {
+        text_color: TEXT,
+        placeholder_color: MUTED,
+        handle_color: MUTED,
+        background: Background::Color(SURFACE_2),
+        border: Border {
+            radius: 0.0.into(),
+            width: 1.0,
+            color: border_c,
+        },
+    }
+}
+
+fn chip(label: impl Into<String>, dot: Option<Color>) -> Element<'static, Message> {
     let mut inner = row![].spacing(8).align_y(Alignment::Center);
     if let Some(color) = dot {
         inner = inner.push(
             container(horizontal_space())
-                .width(8)
-                .height(8)
+                .width(7)
+                .height(7)
                 .style(move |_| container::Style {
                     background: Some(Background::Color(color)),
                     border: Border {
-                        radius: 8.0.into(),
+                        radius: 0.0.into(),
                         ..Border::default()
                     },
                     text_color: None,
@@ -608,10 +746,10 @@ fn chip(label: String, fill: Color, dot: Option<Color>) -> Element<'static, Mess
                 }),
         );
     }
-    inner = inner.push(text(label).size(13));
+    inner = inner.push(text(format!("[ {} ]", label.into())).size(12));
     container(inner)
-        .padding([6, 12])
-        .style(move |_| pill(fill))
+        .padding([4, 8])
+        .style(|_| module())
         .into()
 }
 
@@ -630,30 +768,32 @@ fn control_column(
     let scan_bytes = scan_jpeg_bytes(snap);
     let size_label = format_bytes(scan_bytes as u64);
 
-    let scan_btn = action_button(scan_label, 28.0, can_scan.then_some(Message::Scan), true);
+    let scan_btn = action_button(scan_label, "S", 22.0, can_scan.then_some(Message::Scan), true);
     let save_label = if busy && snap.connection != ConnectionState::Scanning {
         "Working…".into()
     } else if can_save {
-        format!("Save PDF · {size_label}")
+        format!("Save PDF  {size_label}")
     } else {
         "Save PDF".into()
     };
     let save_btn = action_button(
         save_label,
-        20.0,
+        "P",
+        16.0,
         can_save.then_some(Message::SavePdf),
         false,
     );
     let email_label = if !can_save {
         "Email PDF".into()
     } else if scan_bytes <= crate::pdf::EMAIL_MAX_BYTES {
-        format!("Email PDF · {size_label}")
+        format!("Email PDF  {size_label}")
     } else {
-        "Email PDF · under 5 MB".into()
+        "Email PDF  under 5 MB".into()
     };
     let email_btn = action_button(
         email_label,
-        18.0,
+        "E",
+        16.0,
         can_save.then_some(Message::EmailPdf),
         false,
     );
@@ -668,51 +808,35 @@ fn control_column(
     };
 
     let quality = pick_list(ScanPreset::ALL, Some(snap.scan_preset), Message::SetPreset)
-        .text_size(15)
-        .padding([8, 12])
+        .text_size(14)
+        .padding([8, 10])
         .width(Length::Fill)
-        .style(|_, status| {
-            use iced::widget::pick_list::Status;
-            let border_c = match status {
-                Status::Hovered | Status::Opened => ACCENT,
-                Status::Active => Color::from_rgb(0.22, 0.25, 0.34),
-            };
-            iced::widget::pick_list::Style {
-                text_color: TEXT,
-                placeholder_color: MUTED,
-                handle_color: MUTED,
-                background: Background::Color(SURFACE_2),
-                border: Border {
-                    radius: 8.0.into(),
-                    width: 1.0,
-                    color: border_c,
-                },
-            }
-        });
+        .style(pick_style);
+    let scanner = scanner_pick_list(snap);
 
     let transport = row![
-        seg_button("Auto", snap.transport_pref == TransportPref::Auto, Message::SetTransport(TransportPref::Auto), !busy),
-        seg_button("Wi-Fi", snap.transport_pref == TransportPref::Wifi, Message::SetTransport(TransportPref::Wifi), !busy),
-        seg_button("USB", snap.transport_pref == TransportPref::Usb, Message::SetTransport(TransportPref::Usb), !busy),
+        seg_button("AUTO  [A]", snap.transport_pref == TransportPref::Auto, Message::SetTransport(TransportPref::Auto), !busy),
+        seg_button("WI-FI  [W]", snap.transport_pref == TransportPref::Wifi, Message::SetTransport(TransportPref::Wifi), !busy),
+        seg_button("USB  [U]", snap.transport_pref == TransportPref::Usb, Message::SetTransport(TransportPref::Usb), !busy),
     ]
-    .spacing(8);
+    .spacing(0);
 
-    let mut ocr = checkbox("Extract text (OCR)", snap.ocr_enabled)
-        .text_size(16)
+    let mut ocr = checkbox("Extract text (OCR)  [O]", snap.ocr_enabled)
+        .text_size(14)
         .style(|_, status| checkbox_style(status));
     if !busy {
         ocr = ocr.on_toggle(Message::ToggleOcr);
     }
 
-    let mut continuous = checkbox("Continuous feed", snap.continuous)
-        .text_size(16)
+    let mut continuous = checkbox("Continuous feed  [C]", snap.continuous)
+        .text_size(14)
         .style(|_, status| checkbox_style(status));
     if !busy {
         continuous = continuous.on_toggle(Message::ToggleContinuous);
     }
 
-    let mut long_receipt = checkbox("Long receipt", snap.long_receipt)
-        .text_size(16)
+    let mut long_receipt = checkbox("Long receipt  [L]", snap.long_receipt)
+        .text_size(14)
         .style(|_, status| checkbox_style(status));
     if !busy {
         long_receipt = long_receipt.on_toggle(Message::ToggleLongReceipt);
@@ -733,22 +857,25 @@ fn control_column(
         None => "—".into(),
     };
 
-    let mut controls = column![scan_btn, save_btn, email_btn].spacing(12);
+    let mut controls = column![scan_btn, save_btn, email_btn].spacing(8);
     if let Some(hint) = email_hint {
         controls = controls.push(text(hint).size(12).color(MUTED));
     }
-    controls = controls.push(text("Quality").size(11).color(MUTED));
+    controls = controls.push(label("SCANNER  [ ]"));
+    controls = controls.push(scanner);
+    controls = controls.push(label("QUALITY  [1-5]"));
     controls = controls.push(quality);
-    controls = controls.push(text("Connection").size(11).color(MUTED));
+    controls = controls.push(label("CONNECTION"));
     controls = controls.push(transport);
     controls = controls.push(ocr);
     controls = controls.push(continuous);
     controls = controls.push(long_receipt);
     if can_save {
-        controls = controls.push(kv("Scan size", size_label));
+        controls = controls.push(kv("SCAN SIZE", size_label));
     }
-    controls = controls.push(kv("Last PDF", last_pdf));
+    controls = controls.push(kv("LAST PDF", last_pdf));
     controls = controls.push(scrollable(text(err).size(13).color(RED)).height(Length::Fill));
+    controls = controls.push(text(format!("build: {BUILD}")).size(10).color(MUTED));
 
     container(controls)
     .padding(12)
@@ -808,7 +935,7 @@ fn scan_stage(
             .height(Length::Fill)
             .into()
     } else {
-        container(text("No scan yet").size(18).color(MUTED))
+        container(text("// no scan yet").size(16).color(MUTED))
             .width(Length::Fill)
             .height(Length::Fill)
             .center_x(Length::Fill)
@@ -835,7 +962,7 @@ fn scan_stage(
     };
 
     let mut stage = column![
-        row![text("Scan").size(18).color(ACCENT), horizontal_space(), counter]
+        row![text("PREVIEW").size(14).color(ACCENT), horizontal_space(), counter]
             .align_y(Alignment::Center)
     ]
     .spacing(8)
@@ -843,12 +970,12 @@ fn scan_stage(
     if capturing {
         stage = stage.push(
             progress_bar(0.0..=1.0, progress)
-                .height(8.0)
+                .height(4.0)
                 .style(|_theme| progress_bar::Style {
                     background: SURFACE_2.into(),
                     bar: ACCENT.into(),
                     border: Border {
-                        radius: 4.0.into(),
+                        radius: 0.0.into(),
                         ..Border::default()
                     },
                 }),
@@ -915,9 +1042,9 @@ fn page_spinner(spin: u8) -> Element<'static, Message> {
     .style(|_| container::Style {
         background: Some(Background::Color(INK)),
         border: Border {
-            radius: 12.0.into(),
+            radius: 0.0.into(),
             width: 1.0,
-            color: Color::from_rgb(0.22, 0.25, 0.34),
+            color: LINE,
         },
         text_color: Some(TEXT),
         shadow: Shadow::default(),
@@ -950,14 +1077,16 @@ fn feed_overlay(
     if show_continue {
         actions = actions.push(action_button(
             "Continue",
-            20.0,
+            "↵",
+            16.0,
             Some(Message::ContinueFeed),
             true,
         ));
     }
     actions = actions.push(action_button(
         "Cancel",
-        20.0,
+        "ESC",
+        16.0,
         Some(Message::CancelFeed),
         false,
     ));
@@ -1001,9 +1130,9 @@ fn page_image(handle: image::Handle) -> Element<'static, Message> {
     .style(|_| container::Style {
         background: Some(Background::Color(INK)),
         border: Border {
-            radius: 12.0.into(),
+            radius: 0.0.into(),
             width: 1.0,
-            color: Color::from_rgb(0.22, 0.25, 0.34),
+            color: LINE,
         },
         text_color: None,
         shadow: Shadow::default(),
@@ -1035,99 +1164,79 @@ fn format_bytes(n: u64) -> String {
 
 fn action_button(
     label: impl Into<String>,
+    key: &'static str,
     size: f32,
     on_press: Option<Message>,
     scan: bool,
 ) -> Element<'static, Message> {
-    button(text(label.into()).size(size))
-        .on_press_maybe(on_press)
-        .width(Length::Fill)
-        .padding([22, 18])
-        .style(move |_, status| {
-            if scan {
-                scan_style(status)
-            } else {
-                secondary_style(status)
-            }
-        })
-        .into()
+    button(
+        row![
+            text(label.into()).size(size),
+            horizontal_space(),
+            text(format!("[{key}]")).size(12).color(MUTED),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .on_press_maybe(on_press)
+    .width(Length::Fill)
+    .padding([14, 12])
+    .style(move |_, status| {
+        if scan {
+            scan_style(status)
+        } else {
+            secondary_style(status)
+        }
+    })
+    .into()
 }
 
 fn scan_style(status: BtnStatus) -> button::Style {
-    let (bg, border_w, border_c, shadow) = match status {
-        BtnStatus::Hovered => (
-            GREEN_HOVER,
-            2.0,
-            WHITE,
-            Shadow {
-                color: Color::from_rgba(0.18, 0.72, 0.38, 0.55),
-                offset: Vector::new(0.0, 6.0),
-                blur_radius: 22.0,
-            },
-        ),
-        BtnStatus::Pressed => (
-            GREEN_PRESS,
-            2.0,
-            WHITE,
-            Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.2),
-                offset: Vector::new(0.0, 2.0),
-                blur_radius: 8.0,
-            },
-        ),
-        BtnStatus::Disabled => (
-            Color::from_rgb(0.22, 0.28, 0.24),
-            1.0,
-            Color::from_rgb(0.30, 0.36, 0.32),
-            Shadow::default(),
-        ),
-        BtnStatus::Active => (
-            GREEN,
-            1.0,
-            Color::from_rgb(0.45, 0.95, 0.62),
-            Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.28),
-                offset: Vector::new(0.0, 4.0),
-                blur_radius: 18.0,
-            },
-        ),
+    let bg = match status {
+        BtnStatus::Hovered => GREEN_HOVER,
+        BtnStatus::Pressed => GREEN_PRESS,
+        BtnStatus::Disabled => Color::from_rgb(0.18, 0.22, 0.20),
+        BtnStatus::Active => GREEN,
     };
     let text_color = match status {
         BtnStatus::Disabled => MUTED,
-        _ => WHITE,
+        _ => INK,
     };
     button::Style {
         background: Some(Background::Color(bg)),
         text_color,
         border: Border {
-            radius: 16.0.into(),
-            width: border_w,
-            color: border_c,
+            radius: 0.0.into(),
+            width: 1.0,
+            color: match status {
+                BtnStatus::Disabled => LINE,
+                BtnStatus::Hovered => WHITE,
+                _ => GREEN_HOVER,
+            },
         },
-        shadow,
+        shadow: Shadow::default(),
     }
 }
 
 fn secondary_style(status: BtnStatus) -> button::Style {
-    let (bg, border_c, width) = match status {
-        BtnStatus::Hovered => (Color::from_rgb(0.26, 0.32, 0.44), ACCENT, 2.0),
-        BtnStatus::Pressed => (Color::from_rgb(0.14, 0.16, 0.22), ACCENT, 2.0),
-        BtnStatus::Disabled => (Color::from_rgb(0.16, 0.18, 0.22), Color::from_rgb(0.28, 0.30, 0.36), 1.0),
-        BtnStatus::Active => (SURFACE_2, Color::from_rgb(0.32, 0.38, 0.50), 1.0),
+    let (bg, border_c) = match status {
+        BtnStatus::Hovered => (SURFACE_2, ACCENT),
+        BtnStatus::Pressed => (BG, ACCENT),
+        BtnStatus::Disabled => (BG, LINE),
+        BtnStatus::Active => (SURFACE_2, LINE),
     };
     button::Style {
         background: Some(Background::Color(bg)),
-        text_color: if matches!(status, BtnStatus::Disabled) { MUTED } else { WHITE },
+        text_color: if matches!(status, BtnStatus::Disabled) {
+            MUTED
+        } else {
+            TEXT
+        },
         border: Border {
-            radius: 16.0.into(),
-            width,
+            radius: 0.0.into(),
+            width: 1.0,
             color: border_c,
         },
-        shadow: Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.22),
-            offset: Vector::new(0.0, 4.0),
-            blur_radius: 14.0,
-        },
+        shadow: Shadow::default(),
     }
 }
 
@@ -1137,30 +1246,36 @@ fn seg_button(
     msg: Message,
     enabled: bool,
 ) -> Element<'static, Message> {
-    button(text(label).size(14))
+    button(text(label).size(12))
         .on_press_maybe(enabled.then_some(msg))
-        .padding([10, 12])
+        .padding([10, 8])
         .width(Length::Fill)
         .style(move |_, status| {
             let hovered = enabled && matches!(status, BtnStatus::Hovered | BtnStatus::Pressed);
             let bg = if selected {
-                if hovered { GREEN_HOVER } else { GREEN }
+                if hovered {
+                    GREEN_HOVER
+                } else {
+                    GREEN
+                }
             } else if hovered {
-                Color::from_rgb(0.26, 0.32, 0.44)
-            } else {
                 SURFACE_2
+            } else {
+                SURFACE
             };
             button::Style {
                 background: Some(Background::Color(bg)),
-                text_color: if enabled { WHITE } else { MUTED },
+                text_color: if !enabled {
+                    MUTED
+                } else if selected {
+                    INK
+                } else {
+                    TEXT
+                },
                 border: Border {
-                    radius: 10.0.into(),
-                    width: if (hovered || selected) && enabled { 2.0 } else { 1.0 },
-                    color: if (selected || hovered) && enabled {
-                        WHITE
-                    } else {
-                        Color::from_rgb(0.32, 0.38, 0.50)
-                    },
+                    radius: 0.0.into(),
+                    width: 1.0,
+                    color: if selected && enabled { GREEN } else { LINE },
                 },
                 shadow: Shadow::default(),
             }
@@ -1175,12 +1290,18 @@ fn checkbox_style(status: iced::widget::checkbox::Status) -> checkbox::Style {
         iced::widget::checkbox::Status::Disabled { is_checked } => (is_checked, false),
     };
     checkbox::Style {
-        background: Background::Color(if checked { GREEN } else if hovered { Color::from_rgb(0.26, 0.32, 0.44) } else { SURFACE_2 }),
-        icon_color: WHITE,
+        background: Background::Color(if checked {
+            GREEN
+        } else if hovered {
+            SURFACE_2
+        } else {
+            SURFACE
+        }),
+        icon_color: INK,
         border: Border {
-            radius: 6.0.into(),
-            width: if hovered { 2.0 } else { 1.5 },
-            color: if checked || hovered { GREEN_HOVER } else { Color::from_rgb(0.40, 0.46, 0.58) },
+            radius: 0.0.into(),
+            width: 1.0,
+            color: if checked || hovered { GREEN } else { LINE },
         },
         text_color: Some(TEXT),
     }
@@ -1189,10 +1310,14 @@ fn checkbox_style(status: iced::widget::checkbox::Status) -> checkbox::Style {
 fn kv(key: &'static str, value: impl Into<String>) -> Element<'static, Message> {
     column![
         text(key).size(11).color(MUTED),
-        text(value.into()).size(15).color(TEXT),
+        text(value.into()).size(14).color(TEXT),
     ]
     .spacing(2)
     .into()
+}
+
+fn label(s: &'static str) -> Element<'static, Message> {
+    text(s).size(11).color(MUTED).into()
 }
 
 fn card() -> container::Style {
@@ -1200,28 +1325,33 @@ fn card() -> container::Style {
         background: Some(Background::Color(SURFACE)),
         text_color: Some(TEXT),
         border: Border {
-            radius: 18.0.into(),
+            radius: 0.0.into(),
             width: 1.0,
-            color: Color::from_rgb(0.22, 0.25, 0.34),
+            color: LINE,
         },
-        shadow: Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.25),
-            offset: Vector::new(0.0, 8.0),
-            blur_radius: 24.0,
-        },
+        shadow: Shadow::default(),
     }
 }
 
-fn pill(fill: Color) -> container::Style {
+fn module() -> container::Style {
     container::Style {
-        background: Some(Background::Color(fill)),
+        background: Some(Background::Color(BG)),
         border: Border {
-            radius: 999.0.into(),
-            width: 0.0,
-            color: Color::TRANSPARENT,
+            radius: 0.0.into(),
+            width: 1.0,
+            color: LINE,
         },
         text_color: Some(TEXT),
         shadow: Shadow::default(),
+    }
+}
+
+fn key_id(key: &Key) -> String {
+    match key {
+        Key::Named(keyboard::key::Named::Enter) => "enter".into(),
+        Key::Named(keyboard::key::Named::Escape) => "escape".into(),
+        Key::Character(c) => c.to_lowercase(),
+        _ => String::new(),
     }
 }
 
@@ -1247,7 +1377,7 @@ fn spawn_backend(state: SharedState, mut cmd_rx: mpsc::UnboundedReceiver<Backend
                     Ok(escl) => {
                         escl.spawn_poller(Arc::clone(&state));
                         crate::discovery::spawn_lan_probe(Arc::clone(&state));
-                        crate::usb::spawn(Arc::clone(&state), escl.clone());
+                        crate::usb::spawn(Arc::clone(&state));
                         let ocr = OcrEngine::new();
                         while let Some(cmd) = cmd_rx.recv().await {
                             match cmd {
@@ -1270,6 +1400,14 @@ fn start_scan(state: SharedState, escl: EsclClient, ocr: OcrEngine) {
         let mut guard = state.lock();
         if !matches!(guard.connection, ConnectionState::Connected) {
             guard.session.last_error = Some("Connect the scanner first.".into());
+            return;
+        }
+        if guard
+            .status
+            .as_ref()
+            .is_some_and(|s| s.feeder_kind() == crate::state::FeederKind::Empty)
+        {
+            guard.session.last_error = Some("Load a page into the feeder, then scan.".into());
             return;
         }
         let append = guard.scan_append;

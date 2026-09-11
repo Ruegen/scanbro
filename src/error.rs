@@ -14,7 +14,7 @@ pub enum AppError {
     #[error("image decode error: {0}")]
     Image(#[from] image::ImageError),
 
-    #[error("eSCL protocol error: {0}")]
+    #[error("{0}")]
     Escl(String),
 
     #[error("multipart parse error: {0}")]

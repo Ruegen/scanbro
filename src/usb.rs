@@ -7,35 +7,69 @@ use std::time::Duration;
 use tracing::{debug, info};
 
 use crate::error::{AppError, AppResult};
-use crate::escl::EsclClient;
-use crate::state::{ConnectionState, ScannerInfo, SharedState, Transport, TransportPref};
+use crate::state::{ScannerInfo, SharedState, Transport, TransportPref};
 
 const IPP_USB_PORTS: &[u16] = &[60000, 60001, 60002, 60003, 631];
 const DUPLEX_SOURCES: &[&str] = &[
+    "Automatic Document Feeder(left aligned,Duplex)",
     "Automatic Document Feeder(Duplex)",
     "ADF Duplex",
+    "Automatic Document Feeder(left aligned)",
     "Automatic Document Feeder",
     "ADF",
 ];
 const SIMPLEX_SOURCES: &[&str] = &[
+    "Automatic Document Feeder(left aligned)",
     "Automatic Document Feeder",
     "ADF",
     "Automatic Document Feeder(simplex)",
 ];
 
-pub fn spawn(state: SharedState, escl: EsclClient) {
+pub fn spawn(state: SharedState) {
     tokio::spawn(async move {
+        let http = match reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(250))
+            .timeout(Duration::from_millis(800))
+            .pool_max_idle_per_host(0)
+            .http1_only()
+            .tcp_nodelay(true)
+            .build()
+        {
+            Ok(http) => http,
+            Err(_) => return,
+        };
         loop {
             let pref = { state.lock().transport_pref };
             if pref.allows_usb() {
-                match probe(&escl).await {
+                let already_usb = {
+                    state
+                        .lock()
+                        .scanner
+                        .as_ref()
+                        .is_some_and(|s| s.via == Transport::Usb)
+                };
+                match probe(&http, already_usb).await {
                     Some(scanner) => register(&state, scanner),
                     None => {
                         let plugged = brother_usb().is_some();
                         let mut guard = state.lock();
-                        let holding_usb = guard.scanner.as_ref().is_some_and(|s| s.via == Transport::Usb);
-                        if holding_usb && !plugged {
-                            guard.mark_disconnected("USB scanner unplugged. Looking again…");
+                        let holding_usb =
+                            guard.scanner.as_ref().is_some_and(|s| s.via == Transport::Usb);
+                        if !plugged && !holding_usb
+                            && guard
+                                .discovered
+                                .iter()
+                                .any(|s| s.via == Transport::Usb)
+                        {
+                            guard.forget_via(
+                                Transport::Usb,
+                                "USB scanner unplugged. Looking again…",
+                            );
+                        } else if holding_usb && !plugged {
+                            guard.forget_via(
+                                Transport::Usb,
+                                "USB scanner unplugged. Looking again…",
+                            );
                         } else if pref == TransportPref::Usb && !holding_usb {
                             guard.status_line = if plugged {
                                 "USB scanner plugged in. Getting it ready…".into()
@@ -46,53 +80,69 @@ pub fn spawn(state: SharedState, escl: EsclClient) {
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
         }
     });
 }
 
-async fn probe(escl: &EsclClient) -> Option<ScannerInfo> {
-    if let Some(scanner) = list_brother_sane().await {
+async fn probe(http: &reqwest::Client, already_usb: bool) -> Option<ScannerInfo> {
+    if let Some(scanner) = probe_ipp_usb(http).await {
         return Some(scanner);
     }
-    if brother_usb().is_none() {
-        return probe_ipp_usb(escl).await;
+    if already_usb {
+        return None;
     }
-    probe_ipp_usb(escl).await
+    list_brother_sane().await
 }
 
-async fn probe_ipp_usb(escl: &EsclClient) -> Option<ScannerInfo> {
+async fn probe_ipp_usb(http: &reqwest::Client) -> Option<ScannerInfo> {
+    let name = brother_usb().unwrap_or_else(|| "Brother".into());
+    let mut futs = Vec::new();
     for port in IPP_USB_PORTS {
-        let candidate = ScannerInfo {
-            name: "Brother DS-940DW".into(),
-            hostname: "usb".into(),
-            ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port: *port,
-            escl_root: "eSCL".into(),
-            service_type: "usb".into(),
-            via: Transport::Usb,
-            sane_device: None,
-        };
-        match escl.fetch_status(&candidate).await {
-            Ok(_) => {
-                debug!(port, "USB network-style scanner responded");
-                return Some(candidate);
-            }
-            Err(err) => debug!(port, %err, "USB network-style miss"),
-        }
+        let http = http.clone();
+        let name = name.clone();
+        futs.push(async move {
+            let url = format!("http://127.0.0.1:{port}/eSCL/ScannerStatus");
+            http.get(&url)
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?
+                .text()
+                .await
+                .ok()?;
+            debug!(port, "USB network-style scanner responded");
+            Some(ScannerInfo {
+                name,
+                hostname: "usb".into(),
+                ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: *port,
+                escl_root: "eSCL".into(),
+                service_type: "usb".into(),
+                via: Transport::Usb,
+                sane_device: None,
+            })
+        });
     }
-    None
+    let results = futures_util::future::join_all(futs).await;
+    results.into_iter().flatten().next()
 }
 
 async fn list_brother_sane() -> Option<ScannerInfo> {
     if brother_usb().is_none() {
         return None;
     }
-    let output = tokio::process::Command::new("scanimage")
-        .arg("-L")
-        .output()
-        .await
-        .ok()?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::process::Command::new("scanimage")
+            .arg("-L")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -160,34 +210,8 @@ fn register(state: &SharedState, scanner: ScannerInfo) {
     if scanner.sane_device.is_some() && brother_usb().is_none() {
         return;
     }
-    let replace = match &guard.scanner {
-        None => true,
-        Some(existing) if existing.via == Transport::Wifi && brother_usb().is_none() => false,
-        Some(existing) => {
-            existing.via != Transport::Usb
-                || existing.sane_device != scanner.sane_device
-                || existing.port != scanner.port
-        }
-    };
-    if !replace {
-        return;
-    }
     info!(name = %scanner.name, "registered USB scanner");
-    guard.status_line = format!("Found {} on USB.", scanner.name);
-    guard.status = Some(crate::state::ScannerStatus {
-        state: "Idle".into(),
-        adf_state: "Ready".into(),
-        battery_percent: None,
-        reasons: Vec::new(),
-    });
-    if matches!(
-        guard.connection,
-        ConnectionState::AwaitingConnection | ConnectionState::Degraded
-    ) {
-        guard.connection = ConnectionState::Connected;
-    }
-    guard.scanner = Some(scanner);
-    guard.last_seen = Some(std::time::Instant::now());
+    guard.offer_scanner(scanner);
 }
 
 pub fn brother_usb() -> Option<String> {
@@ -280,8 +304,11 @@ pub async fn scan_duplex(
 
         last_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if last_err.is_empty() {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(AppError::Escl("Couldn't scan over USB.".into()));
+            last_err = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        }
+        if last_err.is_empty() {
+            debug!(%source, status = ?output.status, "USB source rejected with no message");
+            continue;
         }
         debug!(%source, %last_err, "USB source rejected");
     }
@@ -337,9 +364,12 @@ fn friendly_sane_error(raw: &str) -> String {
         "Scanner is busy. Try again in a moment.".into()
     } else if lower.contains("permission") || lower.contains("access") {
         "No permission to use the USB scanner.".into()
+    } else if lower.contains("invalid argument") || lower.contains("unknown") {
+        "USB scan settings weren't accepted. Try Scan again.".into()
     } else if raw.trim().is_empty() {
         "Couldn't scan over USB.".into()
     } else {
+        tracing::error!(%raw, "USB scan failed");
         "Couldn't scan over USB.".into()
     }
 }

@@ -103,7 +103,7 @@ impl EsclClient {
                         if let Some(fixed) = client.try_alt_port(&scanner).await {
                             let mut guard = state.lock();
                             guard.status = Some(fixed.0);
-                            guard.scanner = Some(fixed.1);
+                            guard.offer_scanner(fixed.1);
                             guard.last_seen = Some(std::time::Instant::now());
                             guard.connection = crate::state::ConnectionState::Connected;
                             guard.status_line = "Connected over Wi-Fi.".into();
@@ -195,6 +195,8 @@ impl EsclClient {
     ) -> AppResult<(Arc<Vec<u8>>, Arc<Vec<u8>>)> {
         let jobs_url = format!("{}{JOBS_PATH}", scanner.base_url());
         let sides = if long_receipt { 1 } else { 2 };
+        let known_job = { state.lock().last_escl_job.take() };
+        self.cancel_stale_jobs(scanner, known_job.as_deref()).await;
         info!(%jobs_url, long_receipt, dpi, "posting ScanJob");
 
         {
@@ -207,20 +209,18 @@ impl EsclClient {
             };
         }
 
-        let response = self
-            .http
-            .post(&jobs_url)
-            .timeout(SCAN_TIMEOUT)
-            .header(CONTENT_TYPE, "text/xml")
-            .header(http::header::ACCEPT, "*/*")
-            .body(scan_settings(long_receipt, dpi))
-            .send()
-            .await
-            .map_err(AppError::from)?;
+        let response = self.post_scan_job(&jobs_url, long_receipt, dpi).await?;
+        let response = if job_blocked(response.status()) {
+            self.cancel_stale_jobs(scanner, None).await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            self.post_scan_job(&jobs_url, long_receipt, dpi).await?
+        } else {
+            response
+        };
 
         if response.status() == StatusCode::SERVICE_UNAVAILABLE {
             return Err(AppError::Escl(
-                "Scanner is busy. Load a page and try Scan again.".into(),
+                "Load a page into the feeder, then scan.".into(),
             ));
         }
 
@@ -239,13 +239,47 @@ impl EsclClient {
 
         let job_url = job_url_on_scanner(scanner, &job_url);
         debug!(%job_url, "scan job created");
-        state.lock().progress.job_posted = true;
+        {
+            let mut guard = state.lock();
+            guard.progress.job_posted = true;
+            guard.last_escl_job = Some(job_url.clone());
+        }
 
+        let result = self.pull_pages(state, &job_url, long_receipt, sides).await;
+        self.finish_job(&job_url).await;
+        state.lock().last_escl_job = None;
+        result
+    }
+
+    async fn post_scan_job(
+        &self,
+        jobs_url: &str,
+        long_receipt: bool,
+        dpi: u16,
+    ) -> AppResult<reqwest::Response> {
+        self.http
+            .post(jobs_url)
+            .timeout(SCAN_TIMEOUT)
+            .header(CONTENT_TYPE, "text/xml")
+            .header(http::header::ACCEPT, "*/*")
+            .body(scan_settings(long_receipt, dpi))
+            .send()
+            .await
+            .map_err(AppError::from)
+    }
+
+    async fn pull_pages(
+        &self,
+        state: &SharedState,
+        job_url: &str,
+        long_receipt: bool,
+        sides: u8,
+    ) -> AppResult<(Arc<Vec<u8>>, Arc<Vec<u8>>)> {
         let mut pages: Vec<Arc<Vec<u8>>> = Vec::new();
         for index in 0..sides {
             {
                 let mut guard = state.lock();
-                guard.progress.current_side = (index + 1) as u8;
+                guard.progress.current_side = index + 1;
                 guard.progress.current_bytes = 0;
                 guard.progress.expected_bytes = 0;
                 guard.status_line = if long_receipt {
@@ -262,7 +296,9 @@ impl EsclClient {
                 break;
             }
             if page_resp.status() == StatusCode::SERVICE_UNAVAILABLE {
-                return Err(AppError::Escl("Load a page in the feeder, then scan.".into()));
+                return Err(AppError::Escl(
+                    "Load a page into the feeder, then scan.".into(),
+                ));
             }
             let page_resp = page_resp
                 .error_for_status()
@@ -287,10 +323,10 @@ impl EsclClient {
             }
         }
 
-        let _ = self.http.delete(&job_url).send().await;
-
         match pages.len() {
-            0 => Err(AppError::Escl("scan job returned no pages".into())),
+            0 => Err(AppError::Escl(
+                "Load a page into the feeder, then scan.".into(),
+            )),
             1 => {
                 warn!("duplex job yielded a single page; synthesizing empty back");
                 Ok((pages.remove(0), Arc::new(Vec::new())))
@@ -298,6 +334,66 @@ impl EsclClient {
             _ => Ok((pages.remove(0), pages.remove(0))),
         }
     }
+
+    async fn cancel_stale_jobs(&self, scanner: &ScannerInfo, known: Option<&str>) {
+        if let Some(url) = known {
+            self.finish_job(url).await;
+        }
+        let list_url = format!("{}{JOBS_PATH}", scanner.base_url());
+        let Ok(resp) = self
+            .http
+            .get(&list_url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        else {
+            return;
+        };
+        let Ok(body) = resp.text().await else {
+            return;
+        };
+        for uri in job_uris(&body) {
+            let url = job_url_on_scanner(scanner, &uri);
+            if known.is_some_and(|k| k == url) {
+                continue;
+            }
+            self.finish_job(&url).await;
+        }
+    }
+
+    async fn finish_job(&self, job_url: &str) {
+        let _ = self
+            .http
+            .delete(job_url)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await;
+    }
+}
+
+fn job_blocked(status: StatusCode) -> bool {
+    status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::CONFLICT
+}
+
+fn job_uris(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("JobUri") {
+        let after = &rest[start..];
+        let Some(gt) = after.find('>') else {
+            break;
+        };
+        let val = &after[gt + 1..];
+        let Some(end) = val.find('<') else {
+            break;
+        };
+        let uri = val[..end].trim();
+        if uri.contains("ScanJob") || uri.starts_with('/') || uri.starts_with("http") {
+            out.push(uri.to_string());
+        }
+        rest = &val[end..];
+    }
+    out
 }
 
 fn job_url_on_scanner(scanner: &ScannerInfo, location: &str) -> String {

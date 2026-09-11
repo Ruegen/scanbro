@@ -1,16 +1,14 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
-use std::time::Instant;
 
 use futures_util::StreamExt;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use tracing::{debug, info};
 
 use crate::error::AppResult;
-use crate::state::{ConnectionState, ScannerInfo, SharedState, Transport};
+use crate::state::{ScannerInfo, SharedState, Transport};
 
 const USCAN: &str = "_uscan._tcp.local.";
-const TARGET_MARKERS: &[&str] = &["DS-940DW", "DS940DW", "DS-940"];
 
 pub fn spawn(state: SharedState) -> AppResult<ServiceDaemon> {
     let mdns = ServiceDaemon::new()?;
@@ -43,39 +41,14 @@ fn handle_event(state: &SharedState, event: ServiceEvent) {
             if !guard.transport_pref.allows_wifi() {
                 return;
             }
-            if guard
-                .scanner
-                .as_ref()
-                .is_some_and(|s| s.via == Transport::Usb)
-            {
-                return;
-            }
-            let take = match &guard.scanner {
-                None => true,
-                Some(existing) if existing.via == Transport::Wifi => {
-                    scanner.wifi_quality() > existing.wifi_quality()
-                        || (is_target(&scanner.name) && !is_target(&existing.name))
-                }
-                Some(_) => false,
-            };
-            if take {
-                info!(
-                    name = %scanner.name,
-                    ip = %scanner.ip,
-                    port = scanner.port,
-                    root = %scanner.escl_root,
-                    "registered scanner"
-                );
-                guard.status_line = format!("Found {} on Wi-Fi.", scanner.name);
-                if matches!(
-                    guard.connection,
-                    ConnectionState::AwaitingConnection | ConnectionState::Degraded
-                ) {
-                    guard.connection = ConnectionState::Connected;
-                }
-                guard.scanner = Some(scanner);
-                guard.last_seen = Some(Instant::now());
-            }
+            info!(
+                name = %scanner.name,
+                ip = %scanner.ip,
+                port = scanner.port,
+                root = %scanner.escl_root,
+                "registered scanner"
+            );
+            guard.offer_scanner(scanner);
         }
         ServiceEvent::ServiceRemoved(_, fullname) => {
             // Dual-stack mDNS often removes IPv6 or sibling records while HTTP still works.
@@ -148,11 +121,6 @@ fn friendly_device_name(raw: impl AsRef<str>) -> String {
     }
 }
 
-fn is_target(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    TARGET_MARKERS.iter().any(|m| upper.contains(m))
-}
-
 pub async fn discover_once(timeout: std::time::Duration) -> AppResult<Vec<ScannerInfo>> {
     let mdns = ServiceDaemon::new()?;
     let receiver = mdns.browse(USCAN)?;
@@ -209,35 +177,14 @@ pub fn spawn_lan_probe(state: SharedState) {
                 if !guard.transport_pref.allows_wifi() {
                     continue;
                 }
-                if guard.scanner.as_ref().is_some_and(|s| s.via == Transport::Wifi) {
-                    continue;
-                }
             }
             if let Some(scanner) = probe_lan_escl(&http).await {
                 let mut guard = state.lock();
                 if !guard.transport_pref.allows_wifi() {
                     continue;
                 }
-                if guard.scanner.as_ref().is_some_and(|s| s.via == Transport::Usb) {
-                    continue;
-                }
-                if guard.scanner.is_none()
-                    || guard
-                        .scanner
-                        .as_ref()
-                        .is_some_and(|s| scanner.wifi_quality() > s.wifi_quality())
-                {
-                    info!(ip = %scanner.ip, port = scanner.port, "found scanner on the LAN");
-                    guard.status_line = format!("Found {} on Wi-Fi.", scanner.name);
-                    if matches!(
-                        guard.connection,
-                        ConnectionState::AwaitingConnection | ConnectionState::Degraded
-                    ) {
-                        guard.connection = ConnectionState::Connected;
-                    }
-                    guard.scanner = Some(scanner);
-                    guard.last_seen = Some(Instant::now());
-                }
+                info!(ip = %scanner.ip, port = scanner.port, "found scanner on the LAN");
+                guard.offer_scanner(scanner);
             }
         }
     });
