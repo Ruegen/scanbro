@@ -23,6 +23,9 @@ pub enum AppError {
     #[error("PDF error: {0}")]
     Pdf(String),
 
+    #[error("{0}")]
+    Print(String),
+
     #[error("scanner unreachable")]
     Disconnected,
 

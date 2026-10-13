@@ -45,9 +45,11 @@ pub enum Message {
     Tick,
     Scan,
     SavePdf,
+    Print,
     EmailPdf,
     SetPreset(ScanPreset),
     ToggleOcr(bool),
+    ToggleDraft(bool),
     ToggleContinuous(bool),
     ToggleLongReceipt(bool),
     ContinueFeed,
@@ -55,11 +57,13 @@ pub enum Message {
     SetTransport(TransportPref),
     SelectScanner(String),
     FlipOcr,
+    FlipDraft,
     FlipContinuous,
     FlipLongReceipt,
     KeyDown(String),
     KeyUp(String),
     PdfDone(Result<PathBuf, String>),
+    PrintDone(Result<String, String>),
     EmailDone(Result<(), String>),
 }
 
@@ -201,6 +205,7 @@ impl Dashboard {
                 self.email_after = false;
                 self.save_pdf(true)
             }
+            Message::Print => self.print_pdf(),
             Message::EmailPdf => self.email_pdf(),
             Message::SetPreset(preset) => {
                 if self.is_busy() {
@@ -214,6 +219,13 @@ impl Dashboard {
                     return Task::none();
                 }
                 self.shared.lock().ocr_enabled = enabled;
+                Task::none()
+            }
+            Message::ToggleDraft(enabled) => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                self.shared.lock().draft_print = enabled;
                 Task::none()
             }
             Message::ToggleContinuous(enabled) => {
@@ -236,6 +248,14 @@ impl Dashboard {
                 }
                 let mut guard = self.shared.lock();
                 guard.ocr_enabled = !guard.ocr_enabled;
+                Task::none()
+            }
+            Message::FlipDraft => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let mut guard = self.shared.lock();
+                guard.draft_print = !guard.draft_print;
                 Task::none()
             }
             Message::FlipContinuous => {
@@ -349,6 +369,20 @@ impl Dashboard {
                 }
                 Task::none()
             }
+            Message::PrintDone(result) => {
+                self.saving = false;
+                let mut guard = self.shared.lock();
+                match result {
+                    Ok(msg) => {
+                        guard.status_line = msg;
+                        guard.session.last_error = None;
+                    }
+                    Err(err) => {
+                        guard.session.last_error = Some(err);
+                    }
+                }
+                Task::none()
+            }
             Message::EmailDone(result) => {
                 let mut guard = self.shared.lock();
                 match result {
@@ -371,8 +405,10 @@ impl Dashboard {
         match key {
             "s" => self.update(Message::Scan),
             "p" => self.update(Message::SavePdf),
+            "r" => self.update(Message::Print),
             "e" => self.update(Message::EmailPdf),
             "o" => self.update(Message::FlipOcr),
+            "d" => self.update(Message::FlipDraft),
             "c" => self.update(Message::FlipContinuous),
             "l" => self.update(Message::FlipLongReceipt),
             "a" => self.update(Message::SetTransport(TransportPref::Auto)),
@@ -468,6 +504,25 @@ impl Dashboard {
         self.pdf_dpi = dpi;
         self.shared.lock().status_line = "Preparing a PDF under 5 MB…".into();
         Task::perform(write_email_pdf_default(pages, dpi), Message::PdfDone)
+    }
+
+    fn print_pdf(&mut self) -> Task<Message> {
+        if self.saving {
+            return Task::none();
+        }
+        let (pages, dpi) = self.collect_pages();
+        if pages.is_empty() {
+            self.shared.lock().session.last_error = Some("Scan a page before printing.".into());
+            return Task::none();
+        }
+        let draft = self.shared.lock().draft_print;
+        self.saving = true;
+        self.shared.lock().status_line = if draft {
+            "Sending a draft print…".into()
+        } else {
+            "Sending to the printer…".into()
+        };
+        Task::perform(print_preview(pages, dpi, draft), Message::PrintDone)
     }
 
     fn sync_previews(&mut self) {
@@ -797,6 +852,18 @@ fn control_column(
         can_save.then_some(Message::EmailPdf),
         false,
     );
+    let print_label = if snap.draft_print {
+        "Print A4  draft"
+    } else {
+        "Print A4"
+    };
+    let print_btn = action_button(
+        print_label,
+        "R",
+        16.0,
+        can_save.then_some(Message::Print),
+        false,
+    );
     let email_hint = if !can_save {
         None
     } else if scan_bytes <= crate::pdf::EMAIL_MAX_BYTES {
@@ -820,6 +887,13 @@ fn control_column(
         seg_button("USB  [U]", snap.transport_pref == TransportPref::Usb, Message::SetTransport(TransportPref::Usb), !busy),
     ]
     .spacing(0);
+
+    let mut draft = checkbox("Draft print  [D]", snap.draft_print)
+        .text_size(14)
+        .style(|_, status| checkbox_style(status));
+    if !busy {
+        draft = draft.on_toggle(Message::ToggleDraft);
+    }
 
     let mut ocr = checkbox("Extract text (OCR)  [O]", snap.ocr_enabled)
         .text_size(14)
@@ -857,7 +931,7 @@ fn control_column(
         None => "—".into(),
     };
 
-    let mut controls = column![scan_btn, save_btn, email_btn].spacing(8);
+    let mut controls = column![scan_btn, save_btn, print_btn, draft, email_btn].spacing(8);
     if let Some(hint) = email_hint {
         controls = controls.push(text(hint).size(12).color(MUTED));
     }
@@ -1618,6 +1692,13 @@ async fn write_pdf_to(
         .map_err(|err| err.to_string())?;
     info!(path = %path.display(), dpi, "wrote PDF");
     Ok(path)
+}
+
+async fn print_preview(pages: Vec<Arc<Vec<u8>>>, dpi: u16, draft: bool) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || crate::print::print_pages(&pages, dpi, draft))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(|err| err.to_string())
 }
 
 async fn attach_email(path: PathBuf) -> Result<(), String> {

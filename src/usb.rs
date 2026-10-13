@@ -314,7 +314,7 @@ pub async fn scan_duplex(
     }
 
     let result = if scanned {
-        load_pages(&dir, state)
+        load_pages(&dir, state, dpi)
     } else {
         Err(AppError::Escl(friendly_sane_error(&last_err)))
     };
@@ -322,10 +322,14 @@ pub async fn scan_duplex(
     result
 }
 
-fn load_pages(dir: &std::path::Path, state: &SharedState) -> AppResult<(Arc<Vec<u8>>, Arc<Vec<u8>>)> {
-    let front = read_page(dir, 1)?;
+fn load_pages(
+    dir: &std::path::Path,
+    state: &SharedState,
+    dpi: u16,
+) -> AppResult<(Arc<Vec<u8>>, Arc<Vec<u8>>)> {
+    let front = crate::crop::trim_to_page(read_page(dir, 1)?, dpi);
     let back = match read_page(dir, 2) {
-        Ok(bytes) => bytes,
+        Ok(bytes) => crate::crop::trim_to_page(bytes, dpi),
         Err(_) => Arc::new(Vec::new()),
     };
     {

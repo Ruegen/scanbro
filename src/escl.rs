@@ -245,7 +245,9 @@ impl EsclClient {
             guard.last_escl_job = Some(job_url.clone());
         }
 
-        let result = self.pull_pages(state, &job_url, long_receipt, sides).await;
+        let result = self
+            .pull_pages(state, &job_url, long_receipt, dpi, sides)
+            .await;
         self.finish_job(&job_url).await;
         state.lock().last_escl_job = None;
         result
@@ -273,6 +275,7 @@ impl EsclClient {
         state: &SharedState,
         job_url: &str,
         long_receipt: bool,
+        dpi: u16,
         sides: u8,
     ) -> AppResult<(Arc<Vec<u8>>, Arc<Vec<u8>>)> {
         let mut pages: Vec<Arc<Vec<u8>>> = Vec::new();
@@ -305,6 +308,7 @@ impl EsclClient {
                 .map_err(|_| AppError::Escl("Couldn't download a scanned page.".into()))?;
             let extracted = collect_images(page_resp, state).await?;
             for image in extracted {
+                let image = crate::crop::trim_to_page(image, dpi);
                 {
                     let mut guard = state.lock();
                     if index == 0 && pages.is_empty() {

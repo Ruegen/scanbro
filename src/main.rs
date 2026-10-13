@@ -1,8 +1,10 @@
+mod crop;
 mod discovery;
 mod error;
 mod escl;
 mod ocr;
 mod pdf;
+mod print;
 mod state;
 mod ui;
 mod usb;
